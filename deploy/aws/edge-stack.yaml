@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Linxi AI gateway - edge stack (deploy in us-east-1): CloudFront distribution in front of the
+  ALB origin, plus a WAF web ACL that rate-limits the sign-in / sign-up endpoints.
+
+Parameters:
+  OriginDomainName:
+    Type: String
+    Description: Hostname that resolves to the ALB and matches its certificate.
+  OriginVerifySecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+  ViewerCertificateArn:
+    Type: String
+    Description: ACM certificate in us-east-1 covering the aliases.
+  Aliases:
+    Type: CommaDelimitedList
+  OriginReadTimeout:
+    Type: Number
+    Default: 180
+    Description: Seconds CloudFront waits for the origin (first byte, and between packets). Account quota caps it.
+
+Resources:
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: linxi-edge
+      Scope: CLOUDFRONT
+      DefaultAction: {Allow: {}}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: linxi-edge
+      Rules:
+        # Only the account endpoints are rate limited; model API traffic is never touched here.
+        - Name: auth-rate-limit
+          Priority: 1
+          Action: {Block: {}}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: linxi-auth-rate-limit
+          Statement:
+            RateBasedStatement:
+              Limit: 300
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                OrStatement:
+                  Statements:
+                    - ByteMatchStatement:
+                        SearchString: /api/user/login
+                        FieldToMatch: {UriPath: {}}
+                        PositionalConstraint: STARTS_WITH
+                        TextTransformations: [{Priority: 0, Type: LOWERCASE}]
+                    - ByteMatchStatement:
+                        SearchString: /api/user/register
+                        FieldToMatch: {UriPath: {}}
+                        PositionalConstraint: STARTS_WITH
+                        TextTransformations: [{Priority: 0, Type: LOWERCASE}]
+                    - ByteMatchStatement:
+                        SearchString: /api/verification
+                        FieldToMatch: {UriPath: {}}
+                        PositionalConstraint: STARTS_WITH
+                        TextTransformations: [{Priority: 0, Type: LOWERCASE}]
+                    - ByteMatchStatement:
+                        SearchString: /api/reset_password
+                        FieldToMatch: {UriPath: {}}
+                        PositionalConstraint: STARTS_WITH
+                        TextTransformations: [{Priority: 0, Type: LOWERCASE}]
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Linxi AI gateway
+        Aliases: !Ref Aliases
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_All
+        WebACLId: !GetAtt WebAcl.Arn
+        ViewerCertificate:
+          AcmCertificateArn: !Ref ViewerCertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: alb
+            DomainName: !Ref OriginDomainName
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: !Ref OriginReadTimeout
+              OriginKeepaliveTimeout: 60
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref OriginVerifySecret
+        DefaultCacheBehavior:
+          TargetOriginId: alb
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed-CachingDisabled + Managed-AllViewerAndCloudFrontHeaders-2022-06
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
+        CacheBehaviors:
+          # Hashed front-end bundles.
+          - PathPattern: /static/*
+            TargetOriginId: alb
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            # Managed-CachingOptimized
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+Outputs:
+  DistributionId:
+    Value: !Ref Distribution
+  DistributionDomainName:
+    Value: !GetAtt Distribution.DomainName

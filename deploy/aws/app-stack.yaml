@@ -1,0 +1,471 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Linxi AI gateway (new-api) - regional stack: private subnets + NAT, ALB (CloudFront-only),
+  ECS Fargate (1 master + N slave tasks), RDS PostgreSQL Multi-AZ, ElastiCache (Valkey).
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets (>= 2 AZs) for the ALB; the first one hosts the NAT gateway.
+  PrivateSubnetACidr:
+    Type: String
+  PrivateSubnetBCidr:
+    Type: String
+  PrivateSubnetAAz:
+    Type: AWS::EC2::AvailabilityZone::Name
+  PrivateSubnetBAz:
+    Type: AWS::EC2::AvailabilityZone::Name
+  CloudFrontPrefixListId:
+    Type: String
+    Description: com.amazonaws.global.cloudfront.origin-facing prefix list id in this region.
+  OriginCertificateArn:
+    Type: String
+    Description: Regional ACM certificate for the ALB origin hostname.
+  OriginVerifySecret:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: Value of the X-Origin-Verify header CloudFront sends; the ALB forwards only with it.
+  ImageUri:
+    Type: String
+  TaskCpu:
+    Type: String
+    Default: '1024'
+  TaskMemory:
+    Type: String
+    Default: '2048'
+  SlaveMinCount:
+    Type: Number
+    Default: 1
+  SlaveMaxCount:
+    Type: Number
+    Default: 6
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+  DbAllocatedStorage:
+    Type: Number
+    Default: 50
+  DbEngineVersion:
+    Type: String
+    Default: '17.11'
+  CacheNodeType:
+    Type: String
+    Default: cache.t4g.small
+
+Resources:
+  # ---------------------------------------------------------------- network
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: !Ref PrivateSubnetACidr
+      AvailabilityZone: !Ref PrivateSubnetAAz
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: linxi-private-a}]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: !Ref PrivateSubnetBCidr
+      AvailabilityZone: !Ref PrivateSubnetBAz
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: linxi-private-b}]
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: linxi-egress}]
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Select [0, !Ref PublicSubnetIds]
+      Tags: [{Key: Name, Value: linxi-nat}]
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags: [{Key: Name, Value: linxi-private}]
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateSubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRouteTable}
+  PrivateSubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRouteTable}
+
+  # ---------------------------------------------------------------- security groups
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Linxi ALB - HTTPS from CloudFront origin-facing ranges only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+          Description: CloudFront origin-facing
+      Tags: [{Key: Name, Value: linxi-alb-sg}]
+  AppSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Linxi app tasks - 3000 from the ALB only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref AlbSg
+      Tags: [{Key: Name, Value: linxi-app-sg}]
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Linxi PostgreSQL - from app tasks only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppSg
+      Tags: [{Key: Name, Value: linxi-db-sg}]
+  CacheSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Linxi cache - from app tasks only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref AppSg
+      Tags: [{Key: Name, Value: linxi-cache-sg}]
+
+  # ---------------------------------------------------------------- secrets
+  DbPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: linxi/db-master
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"linxi"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+  SessionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: linxi/session-secret
+      GenerateSecretString: {PasswordLength: 48, ExcludePunctuation: true}
+  CryptoSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: linxi/crypto-secret
+      GenerateSecretString: {PasswordLength: 48, ExcludePunctuation: true}
+  SqlDsnSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: linxi/sql-dsn
+      SecretString: !Sub
+        - 'postgresql://linxi:{{resolve:secretsmanager:${DbPasswordSecret}:SecretString:password}}@${Host}:5432/linxi?sslmode=require'
+        - Host: !GetAtt Database.Endpoint.Address
+
+  # ---------------------------------------------------------------- database
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Linxi private subnets
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: linxi-pg
+      Engine: postgres
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      MultiAZ: true
+      StorageType: gp3
+      AllocatedStorage: !Ref DbAllocatedStorage
+      MaxAllocatedStorage: 500
+      StorageEncrypted: true
+      DBName: linxi
+      MasterUsername: linxi
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbPasswordSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSg]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      EnablePerformanceInsights: true
+
+  # ---------------------------------------------------------------- cache
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Linxi private subnets
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+  Cache:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: linxi-cache
+      ReplicationGroupDescription: Linxi AI gateway cache
+      Engine: valkey
+      EngineVersion: '8.2'
+      CacheNodeType: !Ref CacheNodeType
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds: [!Ref CacheSg]
+      SnapshotRetentionLimit: 1
+
+  # ---------------------------------------------------------------- load balancer
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: linxi-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: [!Ref AlbSg]
+      LoadBalancerAttributes:
+        - {Key: idle_timeout.timeout_seconds, Value: '900'}
+        - {Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true'}
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: linxi-app
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 3000
+      TargetType: ip
+      HealthCheckPath: /api/status
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: {HttpCode: '200'}
+      TargetGroupAttributes:
+        - {Key: deregistration_delay.timeout_seconds, Value: '120'}
+        - {Key: load_balancing.algorithm.type, Value: least_outstanding_requests}
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates: [{CertificateArn: !Ref OriginCertificateArn}]
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig: {StatusCode: '403', ContentType: text/plain, MessageBody: Forbidden}
+  ForwardRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 10
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values: [!Ref OriginVerifySecret]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------------------------------------------------------- ECS
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /linxi/app
+      RetentionInDays: 30
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: linxi
+      ClusterSettings: [{Name: containerInsights, Value: enabled}]
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-linxi-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref SqlDsnSecret, !Ref SessionSecret, !Ref CryptoSecret]
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+  MasterTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: linxi-master
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings: [{ContainerPort: 3000}]
+          StopTimeout: 120
+          Environment:
+            - {Name: TZ, Value: Asia/Shanghai}
+            - {Name: NODE_TYPE, Value: master}
+            - {Name: REDIS_CONN_STRING, Value: !Sub 'rediss://${Cache.PrimaryEndPoint.Address}:6379'}
+            - {Name: SYNC_FREQUENCY, Value: '60'}
+            - {Name: BATCH_UPDATE_ENABLED, Value: 'true'}
+            - {Name: ERROR_LOG_ENABLED, Value: 'true'}
+            - {Name: STREAMING_TIMEOUT, Value: '300'}
+          Secrets:
+            - {Name: SQL_DSN, ValueFrom: !Ref SqlDsnSecret}
+            - {Name: SESSION_SECRET, ValueFrom: !Ref SessionSecret}
+            - {Name: CRYPTO_SECRET, ValueFrom: !Ref CryptoSecret}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: master
+  SlaveTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: linxi-slave
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform: {CpuArchitecture: X86_64, OperatingSystemFamily: LINUX}
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings: [{ContainerPort: 3000}]
+          StopTimeout: 120
+          Environment:
+            - {Name: TZ, Value: Asia/Shanghai}
+            - {Name: NODE_TYPE, Value: slave}
+            - {Name: REDIS_CONN_STRING, Value: !Sub 'rediss://${Cache.PrimaryEndPoint.Address}:6379'}
+            - {Name: SYNC_FREQUENCY, Value: '60'}
+            - {Name: BATCH_UPDATE_ENABLED, Value: 'true'}
+            - {Name: ERROR_LOG_ENABLED, Value: 'true'}
+            - {Name: STREAMING_TIMEOUT, Value: '300'}
+          Secrets:
+            - {Name: SQL_DSN, ValueFrom: !Ref SqlDsnSecret}
+            - {Name: SESSION_SECRET, ValueFrom: !Ref SessionSecret}
+            - {Name: CRYPTO_SECRET, ValueFrom: !Ref CryptoSecret}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: slave
+  # Exactly one master: it runs migrations and scheduled jobs.
+  MasterService:
+    Type: AWS::ECS::Service
+    DependsOn: [ForwardRule, PrivateDefaultRoute, PrivateSubnetARoute, PrivateSubnetBRoute]
+    Properties:
+      ServiceName: linxi-master
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref MasterTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 180
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref AppSg]
+      LoadBalancers:
+        - {ContainerName: app, ContainerPort: 3000, TargetGroupArn: !Ref TargetGroup}
+  SlaveService:
+    Type: AWS::ECS::Service
+    DependsOn: MasterService
+    Properties:
+      ServiceName: linxi-slave
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref SlaveTaskDefinition
+      DesiredCount: !Ref SlaveMinCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 180
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+          SecurityGroups: [!Ref AppSg]
+      LoadBalancers:
+        - {ContainerName: app, ContainerPort: 3000, TargetGroupArn: !Ref TargetGroup}
+  SlaveScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub 'service/${Cluster}/${SlaveService.Name}'
+      MinCapacity: !Ref SlaveMinCount
+      MaxCapacity: !Ref SlaveMaxCount
+  SlaveCpuScaling:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: linxi-slave-cpu
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref SlaveScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        PredefinedMetricSpecification: {PredefinedMetricType: ECSServiceAverageCPUUtilization}
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+Outputs:
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName
+  AlbHostedZoneId:
+    Value: !GetAtt Alb.CanonicalHostedZoneID
+  EgressIp:
+    Description: Fixed outbound IP - give this to upstream providers for allowlisting.
+    Value: !Ref NatEip
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  CacheEndpoint:
+    Value: !GetAtt Cache.PrimaryEndPoint.Address
