@@ -162,7 +162,7 @@ export function resolveChatUrl({
 
   if (url.includes('{cherryConfig}')) {
     const payload = {
-      id: 'new-api',
+      id: 'linxi-ai',
       baseUrl: safeServerAddress,
       apiKey: safeApiKey,
     }
@@ -192,7 +192,7 @@ export function resolveChatUrl({
 
   if (url.includes('{aqbotConfig}')) {
     const query = [
-      `name=${encodeURIComponent('New API')}`,
+      `name=${encodeURIComponent('Linxi AI')}`,
       `baseurl=${encodeURIComponent(safeServerAddress)}`,
       `apikey=${encodeURIComponent(safeApiKey)}`,
       'type=openai',

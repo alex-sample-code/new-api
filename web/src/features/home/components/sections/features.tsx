@@ -24,7 +24,7 @@ import {
   Gauge,
   DollarSign,
   Users,
-  HeartHandshake,
+  Cloud,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
@@ -46,14 +46,14 @@ export function Features(_props: FeaturesProps) {
         'Optimized network architecture ensures millisecond response times'
       ),
       span: 'md:col-span-2',
-      icon: <Zap className='size-4 text-blue-400' />,
+      icon: <Zap className='size-4 text-indigo-400' />,
       visual: (
         <div className='mt-4 grid grid-cols-3 gap-2'>
           {['OpenAI', 'Claude', 'Gemini', 'DeepSeek', 'Qwen', 'Llama'].map(
             (name) => (
               <div
                 key={name}
-                className='border-border/30 bg-muted/20 text-muted-foreground flex items-center justify-center rounded-lg border px-3 py-2 text-xs transition-colors duration-300 hover:border-blue-500/30 hover:bg-blue-500/5'
+                className='border-border/30 bg-muted/20 text-muted-foreground flex items-center justify-center rounded-lg border px-3 py-2 text-xs transition-colors duration-300 hover:border-indigo-500/30 hover:bg-indigo-500/5'
               >
                 {name}
               </div>
@@ -114,7 +114,7 @@ export function Features(_props: FeaturesProps) {
                 <div
                   className={`flex size-6 items-center justify-center rounded-full text-[10px] font-bold ${
                     i === 1
-                      ? 'border border-blue-500/30 bg-blue-500/20 text-blue-500'
+                      ? 'border border-indigo-500/30 bg-indigo-500/20 text-indigo-500'
                       : 'border-border/40 bg-muted text-muted-foreground border'
                   }`}
                 >
@@ -148,7 +148,7 @@ export function Features(_props: FeaturesProps) {
             ))}
           </div>
           <div className='text-muted-foreground flex items-center gap-1.5 text-xs'>
-            <Code className='size-3.5 text-blue-500' />
+            <Code className='size-3.5 text-indigo-500' />
             {t('Multi-protocol Compatible')}
           </div>
         </div>
@@ -173,9 +173,11 @@ export function Features(_props: FeaturesProps) {
       desc: t('Multi-user management with flexible permission allocation'),
     },
     {
-      icon: <HeartHandshake className='size-5' strokeWidth={1.5} />,
-      title: t('Open Source'),
-      desc: t('Community driven, self-hosted, and extensible'),
+      icon: <Cloud className='size-5' strokeWidth={1.5} />,
+      title: t('Multi-Cloud Supply'),
+      desc: t(
+        'Models from leading cloud providers with automatic failover'
+      ),
     },
   ]
 
